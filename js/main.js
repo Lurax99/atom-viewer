@@ -8,6 +8,7 @@ import { ELEMENTS, electronConfig, configString, slaterZeff, lLetter } from './e
 import {
   sampleOrbital, density, energyEV, realSubscript, radiusQuantile, BOHR_ANGSTROM,
 } from './physics.js';
+import { MOLECULES, MOL_ELEMENTS, moleculeDef, buildMolecule, moDensity, sampleMO, formulaHTML } from './molecule.js';
 
 const $ = (id) => document.getElementById(id);
 const WORLD_RADIUS = 10; // radio en pantalla del 99 % de la nube más externa
@@ -20,6 +21,7 @@ const DEFAULTS = {
   count: 250000, size: 1.6, bright: 1, bloom: 0.75, clip: 0, balance: true,
   electrons: false, autoRotate: true, rotSpeed: 0.8, twinkle: true,
   nucleus: true, axes: false, stars: true, pos: '#22d3ee', neg: '#f97316',
+  mol: 'HCl', mo: -1,
 };
 const state = { ...DEFAULTS };
 loadHash();
@@ -32,6 +34,9 @@ function loadHash() {
     state[k] = typeof def === 'number' ? Number(v) : typeof def === 'boolean' ? v === '1' : v;
   }
   if (state.mode === 'atom' && !p.has('color')) state.color = 2;
+  if (state.mode === 'molecule' && !p.has('color')) state.color = state.mo < 0 ? 2 : 0;
+  if (!moleculeDef(state.mol)) state.mol = DEFAULTS.mol;
+  state.mo = Math.max(-1, Math.round(state.mo) || 0);
   state.Z = THREE.MathUtils.clamp(Math.round(state.Z) || 1, 1, 118);
   state.n = THREE.MathUtils.clamp(Math.round(state.n) || 1, 1, 7);
   state.l = THREE.MathUtils.clamp(Math.round(state.l) || 0, 0, state.n - 1);
@@ -212,8 +217,7 @@ function disposeCloud() {
   current.objects = [];
 }
 
-function build() {
-  disposeCloud();
+function atomSamples() {
   const orbitals = orbitalList();
   // primero una muestra pequeña de cada orbital para conocer su tamaño
   const sizes = orbitals.map((o) => sampleOrbital(o, 1).r99);
@@ -223,8 +227,16 @@ function build() {
   const totalW = weights.reduce((a, b) => a + b, 0);
   const samples = orbitals.map((o, i) => sampleOrbital(o, orbitals.length === 1 ? state.count
     : Math.max(3000, Math.round((state.count * weights[i]) / totalW))));
+  return { orbitals, samples, rMaxBohr };
+}
+
+function build() {
+  disposeCloud();
+  const isMol = state.mode === 'molecule';
+  const { orbitals, samples, rMaxBohr } = isMol ? moleculeSamples() : atomSamples();
   const scale = WORLD_RADIUS / rMaxBohr;
   cloudGroup.scale.setScalar(scale);
+  if (isMol) buildAtomMarkers(scale);
 
   let total = 0;
   orbitals.forEach((o, i) => {
@@ -243,7 +255,9 @@ function build() {
     g.setAttribute('aRad', new THREE.BufferAttribute(s.rad, 1));
     g.setAttribute('aRnd', new THREE.BufferAttribute(rnd, 1));
     // capas internas muy compactas: se atenúan para que no saturen la imagen
-    const gain = state.mode === 'atom' && state.balance ? THREE.MathUtils.clamp((s.r99 / rMaxBohr) ** 0.7, 0.08, 1) : 1;
+    // nubes moleculares compactas (p. ej. aniones como F⁻) se atenúan para no saturar
+    const gain = state.mode === 'atom' && state.balance ? THREE.MathUtils.clamp((s.r99 / rMaxBohr) ** 0.7, 0.08, 1)
+      : isMol ? 0.55 * THREE.MathUtils.clamp((mol.r98 / mol.extent) ** 2, 0.15, 1) : 1;
     const points = new THREE.Points(g, makeCloudMaterial(o.color, o.omega, gain));
     points.frustumCulled = false;
     points.visible = !hiddenSubshells.has(o.key);
@@ -258,6 +272,7 @@ function build() {
   updateInfo();
   drawChart();
   buildLegend();
+  if (isMol) renderMoChips();
 }
 
 function updateBrightness() {
@@ -277,6 +292,36 @@ function rebuild() {
     $('loader').classList.remove('on');
   }, 16));
 }
+
+// ---------------------------------------------------------------- moléculas
+let mol = null;
+function currentMolecule() {
+  if (!mol || mol.id !== state.mol) mol = buildMolecule(state.mol);
+  if (state.mo >= mol.mos.length) state.mo = -1;
+  return mol;
+}
+
+function moColor(k) {
+  return new THREE.Color().setHSL((0.52 + (k / mol.mos.length) * 0.8) % 1, 0.85, 0.6);
+}
+
+function moleculeSamples() {
+  currentMolecule();
+  const list = state.mo >= 0 ? [state.mo] : mol.mos.map((_, k) => k).filter((k) => mol.mos[k].occ > 0);
+  const totalOcc = list.reduce((a, k) => a + mol.mos[k].occ, 0);
+  const orbitals = list.map((k) => {
+    const m = mol.mos[k];
+    return {
+      key: `mo${k}`, k, occ: m.occ, label: m.label, color: moColor(k),
+      omega: 1.2 * Math.pow(Math.abs(m.E) / 13.6, 0.3), psi2: (x, y, z) => moDensity(mol, k, x, y, z),
+    };
+  });
+  const samples = list.map((k) => sampleMO(mol, k, list.length === 1 ? state.count
+    : Math.max(3000, Math.round((state.count * mol.mos[k].occ) / totalOcc))));
+  return { orbitals, samples, rMaxBohr: mol.extent };
+}
+
+const dens = (o, x, y, z) => (o.psi2 ? o.psi2(x, y, z) : density(o, x, y, z));
 
 // ---------------------------------------------------------------- electrones (Metropolis)
 const TRAIL = 48;
@@ -342,7 +387,7 @@ function buildWalkers() {
       line.frustumCulled = false;
       walkerGroup.add(line);
       walkers.push({
-        o, obj, p, d: density(o, p.x, p.y, p.z), line, trail,
+        o, obj, p, d: dens(o, p.x, p.y, p.z), line, trail,
         sigma: 0.09 * obj.sample.r99, color: c,
       });
     }
@@ -369,7 +414,7 @@ function stepWalkers() {
     if (!w.line.visible) { pos.fill(1e6, i * 3, i * 3 + 3); return; }
     for (let s = 0; s < 3; s++) {
       const x = w.p.x + gauss() * w.sigma, y = w.p.y + gauss() * w.sigma, z = w.p.z + gauss() * w.sigma;
-      const d = density(w.o, x, y, z);
+      const d = dens(w.o, x, y, z);
       if (d >= w.d || Math.random() * w.d < d) { w.p.set(x, y, z); w.d = d; }
     }
     w.trail.copyWithin(3, 0, (TRAIL - 1) * 3);
@@ -409,9 +454,19 @@ const nucleonGeo = new THREE.SphereGeometry(1, 16, 12);
 const protonMat = new THREE.MeshStandardMaterial({ color: 0xff4d6d, emissive: 0x801030, roughness: 0.35, metalness: 0.1 });
 const neutronMat = new THREE.MeshStandardMaterial({ color: 0x9fb4ff, emissive: 0x1b2450, roughness: 0.35, metalness: 0.1 });
 
-function buildNucleus() {
-  nucleusGroup.traverse((o) => { if (o.isInstancedMesh) o.dispose(); });
+function clearNucleus() {
+  nucleusGroup.traverse((o) => {
+    if (o.isInstancedMesh) o.dispose();
+    else if (o.isSprite) { if (o.material.map !== glowTexture) o.material.map.dispose(); o.material.dispose(); }
+    else if (o.isLine) { o.geometry.dispose(); o.material.dispose(); }
+  });
   nucleusGroup.clear();
+  nucleusGroup.rotation.set(0, 0, 0);
+}
+
+function buildNucleus() {
+  clearNucleus();
+  if (state.mode === 'molecule') return; // los átomos se colocan en build()
   const el = ELEMENTS[state.Z - 1];
   const Zp = state.Z;
   const N = Math.max(0, Math.round(el.mass) - Zp);
@@ -444,6 +499,49 @@ function buildNucleus() {
   }));
   glow.scale.setScalar(Math.max(R, r) * 9);
   nucleusGroup.add(glow);
+  nucleusGroup.visible = state.nucleus;
+}
+
+const signed = (v, d = 2) => `${v < 0 ? '−' : '+'}${Math.abs(v).toFixed(d)}`;
+
+function atomLabel(symbol, charge) {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 128;
+  const g = c.getContext('2d');
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.shadowColor = 'rgba(0,0,0,0.9)'; g.shadowBlur = 10;
+  g.font = '700 58px Inter, sans-serif';
+  g.fillStyle = '#e6e9ff';
+  g.fillText(symbol, 128, 48);
+  if (Math.abs(charge) >= 0.01) {
+    g.font = '600 30px JetBrains Mono, monospace';
+    g.fillStyle = charge > 0 ? '#93c5fd' : '#fca5a5';
+    g.fillText(`δ${signed(charge)}`, 128, 100);
+  }
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false, depthWrite: false, transparent: true }));
+  s.scale.set(3.6, 1.8, 1);
+  s.center.set(0.5, -0.25);
+  s.renderOrder = 10;
+  return s;
+}
+
+function buildAtomMarkers(scale) {
+  clearNucleus();
+  const pos = mol.atoms.map((a) => new THREE.Vector3(...a.c).multiplyScalar(scale));
+  for (const b of mol.bonds) {
+    const g = new THREE.BufferGeometry().setFromPoints([pos[b.i], pos[b.j]]);
+    nucleusGroup.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.22, depthWrite: false })));
+  }
+  mol.atoms.forEach((a, i) => {
+    const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTexture, color: mol.params(a.el).color, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true,
+    }));
+    glow.scale.setScalar(a.el === 'H' ? 0.9 : 1.3);
+    glow.position.copy(pos[i]);
+    const label = atomLabel(a.el, mol.charges[i]);
+    label.position.copy(pos[i]);
+    nucleusGroup.add(glow, label);
+  });
   nucleusGroup.visible = state.nucleus;
 }
 
@@ -499,7 +597,65 @@ function orbitalLabel(o, html = true) {
 
 const fmt = (v, d = 3) => Number(v).toFixed(d);
 
+function updateMoleculeInfo() {
+  const d = mol.def;
+  $('infoZ').textContent = '';
+  $('infoSym').innerHTML = formulaHTML(d.f);
+  $('infoMass').textContent = mol.atoms.reduce((s, a) => s + ELEMENTS.find((e) => e.symbol === a.el).mass, 0).toFixed(2);
+  $('infoName').textContent = d.name;
+  $('infoConfig').textContent = `Geometría ${d.geo} · ${mol.nElec} e⁻ de valencia`;
+  document.title = `${d.name} · Atom Viewer`;
+
+  const pct = (map) => [...map].filter(([, v]) => v > 0.04).sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k} ${Math.round(v * 100)}%`).join(' · ');
+  const rows = [];
+  if (state.mo >= 0) {
+    const m = mol.mos[state.mo];
+    const tags = [];
+    if (state.mo === mol.homo) tags.push('<span class="tag">HOMO</span>');
+    if (state.mo === mol.lumo) tags.push('<span class="tag">LUMO</span>');
+    tags.push(m.occ ? `<span class="tag">ocupado · ${m.occ} e⁻</span>` : '<span class="tag exc">vacío</span>');
+    $('orbTitle').innerHTML = m.label + tags.join('');
+    const byEl = new Map();
+    m.byAtom.forEach((v, i) => byEl.set(mol.atoms[i].el, (byEl.get(mol.atoms[i].el) || 0) + v));
+    rows.push(
+      ['Energía', `${fmt(m.E, 2)} eV`],
+      ['Carácter', `${m.sym ? m.sym + ' ' : ''}${m.kind}`],
+      ['Solapamiento', signed(m.op, 3)],
+      ['Por átomo', pct(byEl)],
+      ['Orbitales atómicos', pct(m.byShell)],
+    );
+  } else {
+    $('orbTitle').innerHTML = `Densidad total<span class="tag">${mol.nElec} e⁻</span>`;
+    const pairs = new Map();
+    for (const b of mol.bonds) {
+      const k = [mol.atoms[b.i].el, mol.atoms[b.j].el].join('–');
+      if (!pairs.has(k)) pairs.set(k, b);
+    }
+    const chi = Math.max(0, ...mol.bonds.map((b) => b.dchi));
+    const type = chi < 0.4 ? 'covalente apolar' : chi < 1.7 ? 'covalente polar' : 'iónico';
+    const qEl = new Map();
+    mol.atoms.forEach((a, i) => { if (!qEl.has(a.el)) qEl.set(a.el, mol.charges[i]); });
+    rows.push(['Enlaces', [...pairs].map(([k, b]) => `${k} ${fmt(b.d, 3)} Å`).join(' · ')]);
+    const center = mol.atoms.findIndex((_, i) => mol.bonds.filter((b) => b.i === i || b.j === i).length >= 2);
+    if (center >= 0 && !mol.isLinear) {
+      const nb = mol.bonds.filter((b) => b.i === center || b.j === center).slice(0, 2).map((b) => (b.i === center ? b.j : b.i));
+      const v = nb.map((i) => new THREE.Vector3(...mol.atoms[i].c).sub(new THREE.Vector3(...mol.atoms[center].c)));
+      rows.push(['Ángulo de enlace', `${fmt(THREE.MathUtils.radToDeg(v[0].angleTo(v[1])), 1)}°`]);
+    }
+    rows.push(
+      ['Δχ (Pauling)', `${fmt(chi, 2)} · ${type}`],
+      ['Cargas (Mulliken)', [...qEl].map(([el, q]) => `${el} ${signed(q)}`).join(' · ')],
+      ['Momento dipolar ≈', `${fmt(mol.dipole, 2)} D`],
+      ['HOMO / LUMO', `${fmt(mol.mos[mol.homo].E, 1)} / ${mol.lumo >= 0 ? fmt(mol.mos[mol.lumo].E, 1) : '—'} eV`],
+      ['Magnetismo', mol.unpaired ? `paramagnética (${mol.unpaired} e⁻ desapareados)` : 'diamagnética'],
+    );
+  }
+  $('stats').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+}
+
 function updateInfo() {
+  if (state.mode === 'molecule') { updateMoleculeInfo(); return; }
   const el = ELEMENTS[state.Z - 1];
   $('infoZ').textContent = el.Z;
   $('infoSym').textContent = el.symbol;
@@ -545,7 +701,9 @@ function updateInfo() {
 
 // ---------------------------------------------------------------- gráfica radial
 function drawChart() {
+  if (state.mode === 'molecule') { drawMoleculeChart(); return; }
   const cv = $('radialChart');
+  cv.height = 220;
   const ctx = cv.getContext('2d');
   const W = cv.width, H = cv.height;
   const pad = { l: 16, r: 12, t: 12, b: 34 };
@@ -640,17 +798,145 @@ function drawChart() {
   }
 }
 
+// diagrama de niveles de los orbitales moleculares
+const KIND_COLOR = { enlazante: '#67e8f9', antienlazante: '#f97316', 'no enlazante': '#a5b4fc' };
+let moHits = [];
+
+function drawMoleculeChart() {
+  const cv = $('radialChart');
+  cv.height = 500;
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  const pad = { l: 48, r: 6, t: 26, b: 44 };
+  ctx.clearRect(0, 0, W, H);
+  moHits = [];
+
+  const left = [mol.elements[0]];
+  const right = mol.elements.length > 1 ? mol.elements.slice(1) : [mol.elements[0]];
+  const aos = [];
+  for (const [side, els] of [[-1, left], [1, right]]) {
+    for (const el of els) {
+      const p = mol.params(el);
+      aos.push({ side, el, key: `${el} ${p.n}s`, E: p.Hs, g: 1 });
+      if (p.Hp !== null) aos.push({ side, el, key: `${el} ${p.n}p`, E: p.Hp, g: 3 });
+    }
+  }
+  // niveles: todos los ocupados y los vacíos hasta algo por encima de los orbitales atómicos
+  const topAO = Math.max(...aos.map((a) => a.E));
+  const cut = Math.max(topAO + 5, mol.lumo >= 0 ? mol.mos[mol.lumo].E + 1 : -Infinity);
+  const groups = [];
+  mol.mos.forEach((m, k) => {
+    if (m.E > cut && m.occ === 0) return;
+    const g = groups[groups.length - 1];
+    if (g && Math.abs(mol.mos[g[0]].E - m.E) < 0.02) g.push(k); else groups.push([k]);
+  });
+  const hidden = mol.mos.length - groups.flat().length;
+  const Es = [...groups.flat().map((k) => mol.mos[k].E), ...aos.map((a) => a.E)];
+  const eMin = Math.min(...Es) - 1.5, eMax = Math.max(...Es) + 1.5;
+  const ph = H - pad.t - pad.b;
+  const Y = (e) => pad.t + ((eMax - e) / (eMax - eMin)) * ph;
+  const xL = pad.l + 44, xR = W - pad.r - 44, xM = (pad.l + W - pad.r) / 2 - 20;
+
+  // eje de energía
+  ctx.font = '20px JetBrains Mono, monospace';
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  const step = [2, 5, 10, 20].find((s) => (eMax - eMin) / s <= 7) || 20;
+  for (let e = Math.ceil(eMin / step) * step; e <= eMax; e += step) {
+    ctx.strokeStyle = 'rgba(148,163,255,0.1)';
+    ctx.beginPath(); ctx.moveTo(pad.l, Y(e)); ctx.lineTo(W - pad.r, Y(e)); ctx.stroke();
+    ctx.fillStyle = 'rgba(139,147,184,0.9)';
+    ctx.fillText(String(e), pad.l - 6, Y(e));
+  }
+
+  // conectores orbital atómico → molecular según su peso en el OM
+  const aoEnd = (a) => [a.side < 0 ? xL + 34 : xR - 34, Y(a.E)];
+  const groupX = (g, side) => xM + side * (g.length * 38) / 2;
+  ctx.setLineDash([3, 5]); ctx.lineWidth = 1.5;
+  for (const g of groups) {
+    for (const a of aos) {
+      const w = g.reduce((s, k) => s + (mol.mos[k].byShell.get(a.key) || 0), 0) / g.length;
+      if (w < 0.12) continue;
+      ctx.strokeStyle = `rgba(165,180,252,${Math.min(0.75, 0.15 + w * 0.6)})`;
+      const [x0, y0] = aoEnd(a);
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(groupX(g, a.side), Y(mol.mos[g[0]].E)); ctx.stroke();
+    }
+  }
+  ctx.setLineDash([]);
+
+  // orbitales atómicos
+  ctx.textBaseline = 'middle';
+  for (const a of aos) {
+    const x = a.side < 0 ? xL : xR, y = Y(a.E);
+    ctx.strokeStyle = mol.params(a.el).color; ctx.lineWidth = 3;
+    for (let i = 0; i < a.g; i++) {
+      const w = 68 / a.g, x0 = x - 34 + i * w;
+      ctx.beginPath(); ctx.moveTo(x0 + 2, y); ctx.lineTo(x0 + w - 2, y); ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(230,233,255,0.85)';
+    ctx.textAlign = 'center';
+    ctx.font = '20px JetBrains Mono, monospace';
+    ctx.fillText(a.key, x, y - 16);
+  }
+
+  // orbitales moleculares con sus electrones
+  let lastLabelY = -1e9;
+  for (const g of groups) {
+    const y = Y(mol.mos[g[0]].E);
+    const x0 = xM - (g.length * 38) / 2;
+    g.forEach((k, i) => {
+      const m = mol.mos[k];
+      const sel = k === state.mo;
+      const xs = x0 + i * 38 + 3, xe = xs + 32;
+      ctx.strokeStyle = sel ? '#ffffff' : KIND_COLOR[m.kind];
+      ctx.lineWidth = sel ? 5 : 3.5;
+      ctx.shadowColor = sel ? '#67e8f9' : KIND_COLOR[m.kind]; ctx.shadowBlur = sel ? 16 : 6;
+      ctx.beginPath(); ctx.moveTo(xs, y); ctx.lineTo(xe, y); ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.font = '600 24px Inter, sans-serif';
+      const arrows = m.occ === 2 ? '↑↓' : m.occ === 1 ? '↑' : '';
+      if (arrows) ctx.fillText(arrows, (xs + xe) / 2, y - 12);
+      moHits.push({ x0: xs, x1: xe, y, k });
+    });
+    if (Math.abs(y - lastLabelY) > 22) {
+      const k = g[g.length - 1], m = mol.mos[k];
+      const tag = g.includes(mol.homo) ? ' HOMO' : g.includes(mol.lumo) ? ' LUMO' : '';
+      ctx.textAlign = 'left'; ctx.font = '20px JetBrains Mono, monospace';
+      ctx.fillStyle = g.includes(state.mo) ? '#ffffff' : 'rgba(230,233,255,0.75)';
+      ctx.fillText(m.label + tag, x0 + g.length * 38 + 6, y);
+      lastLabelY = y;
+    }
+  }
+
+  // leyenda
+  ctx.font = '19px Inter, sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  let lx = pad.l;
+  for (const [kind, col] of Object.entries(KIND_COLOR)) {
+    ctx.fillStyle = col; ctx.fillRect(lx, H - 18, 18, 5);
+    ctx.fillStyle = 'rgba(139,147,184,0.95)';
+    ctx.fillText(kind, lx + 24, H - 15);
+    lx += 40 + ctx.measureText(kind).width;
+  }
+  if (hidden) { ctx.textAlign = 'right'; ctx.fillText(`+${hidden} más altos`, W - pad.r, pad.t - 10); }
+  ctx.save();
+  ctx.translate(14, pad.t + ph / 2); ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = 'center'; ctx.fillText('E (eV)', 0, 0);
+  ctx.restore();
+}
+
 function buildLegend() {
   const box = $('legend');
-  if (state.mode !== 'atom') { box.innerHTML = ''; return; }
-  const seen = new Map();
-  for (const { orbital: o } of current.objects) seen.set(o.key, (seen.get(o.key) || 0) + o.occ);
   box.innerHTML = '';
-  for (const [key, occ] of seen) {
-    const o = current.objects.find((x) => x.orbital.key === key).orbital;
+  if (state.mode === 'orbital' || (state.mode === 'molecule' && state.mo >= 0)) return;
+  const seen = new Map();
+  for (const { orbital: o } of current.objects) {
+    const it = seen.get(o.key) || { o, occ: 0 };
+    it.occ += o.occ;
+    seen.set(o.key, it);
+  }
+  for (const [key, { o, occ }] of seen) {
     const b = document.createElement('button');
-    b.innerHTML = `<i style="color:#${o.color.getHexString()};background:#${o.color.getHexString()}"></i>${key}<sup>${occ}</sup>`;
-    b.title = 'Mostrar/ocultar subcapa';
+    b.innerHTML = `<i style="color:#${o.color.getHexString()};background:#${o.color.getHexString()}"></i>${o.label || key}<sup>${occ}</sup>`;
+    b.title = state.mode === 'atom' ? 'Mostrar/ocultar subcapa' : 'Mostrar/ocultar orbital molecular';
     b.classList.toggle('off', hiddenSubshells.has(key));
     b.onclick = () => {
       if (hiddenSubshells.has(key)) hiddenSubshells.delete(key); else hiddenSubshells.add(key);
@@ -694,8 +980,70 @@ function renderQuantumButtons() {
     `<button data-n="${s.n}" data-l="${s.l}" class="${s.n === state.n && s.l === state.l ? 'on' : ''}">${s.n}${lLetter(s.l)}<sup>${s.occ}</sup></button>`).join('');
 }
 
+function renderMolSelect() {
+  const groups = ['Diatómicas', 'Poliatómicas'];
+  const def = moleculeDef(state.mol);
+  let html = def.group === 'custom' ? `<optgroup label="Personalizada"><option value="${def.id}">${def.f} · ${def.name}</option></optgroup>` : '';
+  for (const g of groups) {
+    html += `<optgroup label="${g}">${MOLECULES.filter((m) => m.group === g).map((m) => `<option value="${m.id}">${m.f} · ${m.name}</option>`).join('')}</optgroup>`;
+  }
+  $('molSelect').innerHTML = html;
+  $('molSelect').value = state.mol;
+  const opts = MOL_ELEMENTS.map((s) => `<option value="${s}">${s} · ${ELEMENTS.find((e) => e.symbol === s).name}</option>`).join('');
+  if (!$('molA').options.length) {
+    $('molA').innerHTML = opts; $('molB').innerHTML = opts;
+    $('molA').value = 'H'; $('molB').value = 'Cl';
+  }
+  if (def.atoms.length === 2) { $('molA').value = def.atoms[0].el; $('molB').value = def.atoms[1].el; }
+}
+
+function renderMoChips() {
+  const chips = [`<button data-k="-1" class="${state.mo < 0 ? 'on' : ''}">Densidad total</button>`];
+  mol.mos.forEach((m, k) => {
+    const cls = [k === state.mo ? 'on' : '', m.occ ? '' : 'virt'].join(' ');
+    const tag = k === mol.homo ? ' HOMO' : k === mol.lumo ? ' LUMO' : '';
+    chips.push(`<button data-k="${k}" class="${cls}" title="${m.kind} · ${m.occ} e⁻${tag}">${m.label}<sub>${fmt(m.E, 1)}</sub></button>`);
+  });
+  $('moChips').innerHTML = chips.join('');
+}
+
+function setColorMode(c) {
+  state.color = c;
+  common.uMode.value = c;
+  $('colorMode').value = String(c);
+  $('phaseColors').style.display = c === 0 ? '' : 'none';
+}
+
+function selectMO(k) {
+  state.mo = k;
+  setColorMode(k < 0 ? 2 : 0);
+  hiddenSubshells.clear();
+  rebuild();
+}
+
+function setMolecule(id) {
+  const m = /^(\w+)-(\w+)$/.exec(id);
+  if (m) { // si el par coincide con una molécula predefinida, se usa su geometría experimental
+    const preset = MOLECULES.find((x) => x.atoms.length === 2 && [m[1], m[2]].sort().join() === x.atoms.map((a) => a.el).sort().join());
+    if (preset) id = preset.id;
+  }
+  state.mol = id;
+  state.mo = -1;
+  setColorMode(2);
+  hiddenSubshells.clear();
+  syncUI();
+  rebuild();
+}
+
 function syncUI() {
   setSeg('modeSeg', state.mode);
+  const isMol = state.mode === 'molecule';
+  $('elementGroup').style.display = isMol ? 'none' : '';
+  $('moleculeGroup').style.display = isMol ? '' : 'none';
+  $('chartCard').classList.toggle('mol', isMol);
+  $('symbolBtn').classList.toggle('mol', isMol);
+  $('chartTitle').innerHTML = isMol ? 'Diagrama de orbitales moleculares' : 'Distribución radial <i>P(r) = r²|R(r)|²</i>';
+  if (isMol) renderMolSelect();
   setSeg('basisSeg', state.basis);
   setSeg('clipSeg', state.clip);
   $('orbitalGroup').style.display = state.mode === 'orbital' ? '' : 'none';
@@ -708,6 +1056,7 @@ function syncUI() {
 function setElement(Z) {
   state.Z = THREE.MathUtils.clamp(Z, 1, 118);
   hiddenSubshells.clear();
+  if (state.mode === 'molecule') { state.mode = 'orbital'; setColorMode(0); }
   if (state.mode === 'orbital') {
     // al cambiar de elemento, muestra su orbital de valencia (el último en llenarse)
     const cfg = electronConfig(state.Z);
@@ -721,9 +1070,9 @@ function setElement(Z) {
 
 seg('modeSeg', (v) => {
   state.mode = v;
-  state.color = v === 'atom' ? 2 : 0;
-  common.uMode.value = state.color;
+  setColorMode(v === 'atom' || (v === 'molecule' && state.mo < 0) ? 2 : 0);
   hiddenSubshells.clear();
+  buildNucleus();
   syncUI();
   rebuild();
 });
@@ -738,6 +1087,20 @@ $('occChips').addEventListener('click', (e) => {
   if (!b) return;
   state.n = +b.dataset.n; state.l = +b.dataset.l; state.m = 0;
   syncUI(); rebuild();
+});
+
+$('molSelect').addEventListener('change', (e) => setMolecule(e.target.value));
+$('molJoin').addEventListener('click', () => setMolecule(`${$('molA').value}-${$('molB').value}`));
+$('moChips').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (b) selectMO(+b.dataset.k);
+});
+$('radialChart').addEventListener('click', (e) => {
+  if (state.mode !== 'molecule') return;
+  const cv = e.currentTarget, r = cv.getBoundingClientRect();
+  const x = ((e.clientX - r.left) * cv.width) / r.width, y = ((e.clientY - r.top) * cv.height) / r.height;
+  const hit = moHits.find((h) => x >= h.x0 - 4 && x <= h.x1 + 4 && Math.abs(y - h.y) < 16);
+  if (hit) selectMO(hit.k === state.mo ? -1 : hit.k);
 });
 
 $('colorMode').addEventListener('change', (e) => {
@@ -821,7 +1184,9 @@ $('shotBtn').addEventListener('click', () => {
   composer.render();
   const a = document.createElement('a');
   const el = ELEMENTS[state.Z - 1];
-  a.download = `atom-viewer-${el.symbol}-${state.mode === 'orbital' ? orbitalLabel(current.objects[0].orbital, false).replace(/\s+/g, '_') : 'atomo'}.png`;
+  a.download = state.mode === 'molecule'
+    ? `atom-viewer-${mol.def.f}-${state.mo >= 0 ? mol.mos[state.mo].label.replace('*', '_anti').replace(/\s+/g, '_') : 'densidad'}.png`
+    : `atom-viewer-${el.symbol}-${state.mode === 'orbital' ? orbitalLabel(current.objects[0].orbital, false).replace(/\s+/g, '_') : 'atomo'}.png`;
   a.href = canvas.toDataURL('image/png');
   a.click();
   toast('Captura guardada');
@@ -894,7 +1259,11 @@ function filterTable(q) {
   }
 }
 $('openTable').addEventListener('click', openTable);
-$('symbolBtn').addEventListener('click', openTable);
+$('symbolBtn').addEventListener('click', () => {
+  if (state.mode !== 'molecule') { openTable(); return; }
+  $('panel').classList.remove('collapsed');
+  $('molSelect').focus();
+});
 $('closeTable').addEventListener('click', closeTable);
 $('tableModal').addEventListener('click', (e) => { if (e.target === $('tableModal')) closeTable(); });
 $('elSearch').addEventListener('input', (e) => filterTable(e.target.value));
@@ -908,7 +1277,10 @@ addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
   if (e.key === 'Escape') closeTable();
   else if (e.key === 't' || e.key === 'T') openTable();
-  else if (e.key === 'ArrowRight') setElement(state.Z + 1);
+  else if (state.mode === 'molecule' && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
+    const k = THREE.MathUtils.clamp(state.mo + (e.key === 'ArrowRight' ? 1 : -1), -1, mol.mos.length - 1);
+    if (k !== state.mo) selectMO(k);
+  } else if (e.key === 'ArrowRight') setElement(state.Z + 1);
   else if (e.key === 'ArrowLeft') setElement(state.Z - 1);
   else if (e.key === ' ') { state.autoRotate = !state.autoRotate; $('autoRotate').checked = state.autoRotate; controls.autoRotate = state.autoRotate; e.preventDefault(); }
 });
@@ -966,8 +1338,10 @@ function animate() {
   common.uCamDir.value.copy(camera.position).sub(controls.target).normalize();
   if (state.electrons) stepWalkers();
   stars.rotation.z += 0.00008;
-  nucleusGroup.rotation.z += 0.004;
-  nucleusGroup.rotation.x += 0.002;
+  if (state.mode !== 'molecule') {
+    nucleusGroup.rotation.z += 0.004;
+    nucleusGroup.rotation.x += 0.002;
+  }
   composer.render();
 }
 

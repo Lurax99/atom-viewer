@@ -42,7 +42,7 @@
   <!-- Distribución radial -->
   <section class="card chart" id="chartCard">
     <div class="chart-head">
-      <span>Distribución radial <i>P(r) = r²|R(r)|²</i></span>
+      <span id="chartTitle">Distribución radial <i>P(r) = r²|R(r)|²</i></span>
       <button class="icon-btn small" id="chartToggle" title="Ocultar">–</button>
     </div>
     <canvas id="radialChart" width="560" height="220"></canvas>
@@ -65,10 +65,24 @@
         <div class="seg" id="modeSeg">
           <button data-v="orbital" class="on">Orbital</button>
           <button data-v="atom">Átomo completo</button>
+          <button data-v="molecule">Molécula</button>
         </div>
       </div>
 
-      <div class="group">
+      <div class="group" id="moleculeGroup">
+        <label class="lbl">Molécula</label>
+        <select id="molSelect"></select>
+        <label class="lbl sub">Unir dos átomos <span class="hint">distancia estimada por radios covalentes</span></label>
+        <div class="row">
+          <select id="molA"></select><span class="plus">+</span><select id="molB"></select>
+        </div>
+        <button class="btn" id="molJoin">Unir y calcular</button>
+        <label class="lbl sub">Orbital molecular <span class="hint">energía en eV · también clic en el diagrama</span></label>
+        <div class="chips" id="moChips"></div>
+        <p class="foot">Orbitales moleculares por combinación lineal de los orbitales atómicos de valencia (método de Hückel extendido), con las mismas funciones hidrogenoides y Z<sub>ef</sub> de Slater. Los solapamientos se integran numéricamente; los electrones internos no se muestran. Cargas parciales de Mulliken.</p>
+      </div>
+
+      <div class="group" id="elementGroup">
         <label class="lbl">Elemento</label>
         <div class="row">
           <button class="btn wide" id="openTable">Tabla periódica</button>
